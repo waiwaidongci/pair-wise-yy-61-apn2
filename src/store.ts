@@ -1,5 +1,5 @@
 import { configureStore, createSlice, type PayloadAction } from '@reduxjs/toolkit';
-import { maintenanceApi } from './api';
+import { maintenanceApi, lifeData, type LifePart, type LifeEventRecord } from './api';
 
 export type StageSignature = { stage: string; status: '待签署' | '已签署'; actor: string; time: string };
 export type OfflineCard = {
@@ -28,6 +28,9 @@ type MaintenanceState = {
   signatures: StageSignature[];
   released: boolean;
   audit: { time: string; actor: string; action: string; detail: string }[];
+  fuselageCycles: number; // 机身循环（寿命账基准）
+  lifeParts: LifePart[]; // 时寿件台账
+  lifeEvents: LifeEventRecord[]; // 寿命账事件（含草稿/冲突/失败）
 };
 
 const initialCards: OfflineCard[] = [
@@ -43,7 +46,7 @@ const initialCards: OfflineCard[] = [
 
 const raw = typeof localStorage !== 'undefined' ? localStorage.getItem('yy61-work-package') : null;
 const saved = raw ? JSON.parse(raw) : null;
-const initialState: MaintenanceState = saved ?? {
+const defaultState: MaintenanceState = {
   cards: initialCards,
   activeCardId: 'CARD-03',
   syncVersion: 7,
@@ -62,8 +65,31 @@ const initialState: MaintenanceState = saved ?? {
     { time: '08:54', actor: '赵明', action: '完成工卡', detail: 'CARD-01 间隙测量 1.62 mm' },
     { time: '09:05', actor: '宋杰', action: '提交测量', detail: 'CARD-03 压力 2762 psi，低于容差' },
     { time: '09:20', actor: '系统', action: '阻断', detail: 'CARD-03 等待授权处理' }
-  ]
+  ],
+  fuselageCycles: lifeData.fuselageCycles,
+  lifeParts: lifeData.parts,
+  lifeEvents: []
 };
+const initialState: MaintenanceState = saved ? { ...defaultState, ...saved } : defaultState;
+
+// 寿命账：循环/履历变化后只重算当前装机件，已拆件保留原值
+function recalcInstalledParts(parts: LifePart[], fuselageCycles: number): LifePart[] {
+  return parts.map((part) => {
+    if (part.status === '已拆') return part; // 已拆件保留原值，不参与重算
+    const currentCycles = fuselageCycles - part.installCycles;
+    return { ...part, currentCycles, remainingCycles: part.limitCycles - currentCycles };
+  });
+}
+
+// 依赖签字：寿命账变化后失效，需重新签署
+const LIFE_DEPENDENT_STAGES = ['机械', '放行'];
+function invalidateDependentSignatures(signatures: StageSignature[]): StageSignature[] {
+  return signatures.map((item) =>
+    LIFE_DEPENDENT_STAGES.includes(item.stage) && item.status === '已签署'
+      ? { ...item, status: '待签署' as const, actor: '待指定', time: '-' }
+      : item
+  );
+}
 
 const slice = createSlice({
   name: 'maintenance',
@@ -108,15 +134,78 @@ const slice = createSlice({
     releasePackage(state) {
       const hasBlockers = state.cards.some((card) => card.status === '待授权');
       const allSigned = state.signatures.every((item) => item.status === '已签署');
-      if (!hasBlockers && allSigned) {
+      // 寿命账门禁：所有在装时寿件剩余循环 ≥ 500，已拆件保留固化值不参与判定
+      const llpOk = state.lifeParts.every((part) => part.status === '已拆' || part.remainingCycles >= 500);
+      if (!hasBlockers && allSigned && llpOk) {
         state.released = true;
-        state.audit.unshift({ time: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }), actor: '质量经理', action: '锁定放行', detail: '工作包 R7 已锁定并形成放行基线' });
+        state.audit.unshift({ time: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }), actor: '质量经理', action: '锁定放行', detail: '工作包 R7 已锁定并形成放行基线（时寿件寿命账已核验）' });
+      }
+    },
+    // ---- 寿命账 ----
+    updateFuselageCycles(state, action: PayloadAction<number>) {
+      const previous = state.fuselageCycles;
+      state.fuselageCycles = action.payload;
+      // 只重算当前装机件，已拆件保留原值
+      state.lifeParts = recalcInstalledParts(state.lifeParts, action.payload);
+      // 依赖签字失效，放行基线作废
+      state.signatures = invalidateDependentSignatures(state.signatures);
+      state.released = false;
+      state.audit.unshift({ time: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }), actor: '当前用户', action: '循环更新', detail: `机身循环 ${previous} → ${action.payload}，在装件已重算，依赖签字失效` });
+    },
+    correctPartHistory(state, action: PayloadAction<{ partId: string; installCycles: number }>) {
+      const part = state.lifeParts.find((item) => item.id === action.payload.partId);
+      if (!part) return;
+      const previous = part.installCycles;
+      part.installCycles = action.payload.installCycles;
+      // 只重算当前装机件；已拆件保留原值，不参与重算
+      if (part.status === '在装') {
+        const currentCycles = state.fuselageCycles - part.installCycles;
+        part.currentCycles = currentCycles;
+        part.remainingCycles = part.limitCycles - currentCycles;
+      }
+      // 依赖签字失效，放行基线作废
+      state.signatures = invalidateDependentSignatures(state.signatures);
+      state.released = false;
+      state.audit.unshift({ time: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }), actor: '当前用户', action: '履历修正', detail: `${part.id} 装机循环 ${previous} → ${action.payload.installCycles}，在装件已重算，依赖签字失效` });
+    },
+    installLifePart(state, action: PayloadAction<{ partNumber: string; serial: string; name: string; location: string; limitCycles: number; workCardId: string }>) {
+      const id = `LLP-${String(state.lifeParts.length + 1).padStart(3, '0')}`;
+      // 装机冻结机身循环
+      state.lifeParts.push({
+        id,
+        ...action.payload,
+        status: '在装',
+        installCycles: state.fuselageCycles,
+        installDate: new Date().toISOString().slice(0, 10),
+        currentCycles: 0,
+        remainingCycles: action.payload.limitCycles
+      });
+      state.audit.unshift({ time: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }), actor: '当前用户', action: '装机入账', detail: `${id} ${action.payload.name} 装机，冻结机身循环 ${state.fuselageCycles}` });
+    },
+    removeLifePart(state, action: PayloadAction<{ partId: string; reason: string }>) {
+      const part = state.lifeParts.find((item) => item.id === action.payload.partId);
+      if (!part || part.status !== '在装') return;
+      // 拆下固化消耗
+      part.removeCycles = state.fuselageCycles - part.installCycles;
+      part.currentCycles = part.removeCycles;
+      part.remainingCycles = part.limitCycles - part.removeCycles;
+      part.status = '已拆';
+      part.removeDate = new Date().toISOString().slice(0, 10);
+      part.removeReason = action.payload.reason;
+      state.audit.unshift({ time: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }), actor: '当前用户', action: '拆下固化', detail: `${part.id} ${part.name} 拆下，固化消耗 ${part.removeCycles} 循环` });
+    },
+    recordLifeEvent(state, action: PayloadAction<LifeEventRecord>) {
+      const index = state.lifeEvents.findIndex((item) => item.eventNo === action.payload.eventNo);
+      if (index >= 0) {
+        state.lifeEvents[index] = action.payload; // 同事件号更新（幂等）
+      } else {
+        state.lifeEvents.unshift(action.payload);
       }
     }
   }
 });
 
-export const { selectCard, updateCard, setConflict, refreshVersion, toggleOffline, authorizeOverride, signStage, releasePackage } = slice.actions;
+export const { selectCard, updateCard, setConflict, refreshVersion, toggleOffline, authorizeOverride, signStage, releasePackage, updateFuselageCycles, correctPartHistory, installLifePart, removeLifePart, recordLifeEvent } = slice.actions;
 
 export const store = configureStore({
   reducer: { maintenance: slice.reducer, [maintenanceApi.reducerPath]: maintenanceApi.reducer },

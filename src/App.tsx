@@ -43,8 +43,16 @@ import {
   PeopleRegular,
   WarningRegular
 } from '@fluentui/react-icons';
-import { useGetWorkPackageQuery, useSubmitCardMutation } from './api';
-import { authorizeOverride, refreshVersion, releasePackage, selectCard, setConflict, signStage, toggleOffline, updateCard, type RootState } from './store';
+import { useGetWorkPackageQuery, useSubmitCardMutation, useSubmitPartEventMutation } from './api';
+import type { LifeEventRecord, LifePart } from './api';
+import { authorizeOverride, correctPartHistory, installLifePart, recordLifeEvent, refreshVersion, releasePackage, removeLifePart, selectCard, setConflict, signStage, toggleOffline, updateCard, updateFuselageCycles, type RootState } from './store';
+
+function nowString() {
+  return new Date().toLocaleString('zh-CN', { hour12: false });
+}
+function genEventNo() {
+  return `EVT-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+}
 
 type NavItem = { path: string; label: string; icon: ReactNode };
 
@@ -54,6 +62,7 @@ function Shell({ children }: { children: ReactNode }) {
   const nav: NavItem[] = [
     { path: '/', label: '工作包总览', icon: <ClipboardTaskListLtrRegular /> },
     { path: '/execution', label: '工卡执行', icon: <BookOpenRegular /> },
+    { path: '/life', label: '时寿件台账', icon: <GaugeRegular /> },
     { path: '/release', label: '放行审阅', icon: <LockClosedRegular /> },
     { path: '/audit', label: '审计与差异', icon: <HistoryRegular /> }
   ];
@@ -207,10 +216,13 @@ function Release() {
   const [tab, setTab] = useState('open');
   const blockers = state.cards.filter((card) => card.status !== '已完成' && card.status !== '未开始');
   const allSigned = state.signatures.every((item) => item.status === '已签署');
+  const llpOk = state.lifeParts.every((part) => part.status === '已拆' || part.remainingCycles >= 500);
+  const lowRemaining = state.lifeParts.filter((part) => part.status === '在装' && part.remainingCycles < 500);
   return (
     <div className="page">
-      <PageHeading eyebrow="RELEASE REVIEW / B-7891" title="放行审阅" description="核对未关闭项目、重复缺陷、关键证据与阶段签字。" actions={<Button appearance="primary" icon={<LockClosedRegular />} disabled={!allSigned || blockers.some((card) => card.status === '待授权')} onClick={() => dispatch(releasePackage())}>{state.released ? '工作包已锁定' : '锁定并放行'}</Button>} />
+      <PageHeading eyebrow="RELEASE REVIEW / B-7891" title="放行审阅" description="核对未关闭项目、重复缺陷、关键证据、时寿件寿命账与阶段签字。" actions={<Button appearance="primary" icon={<LockClosedRegular />} disabled={!allSigned || blockers.some((card) => card.status === '待授权') || !llpOk} onClick={() => dispatch(releasePackage())}>{state.released ? '工作包已锁定' : '锁定并放行'}</Button>} />
       {state.released && <MessageBar intent="success" className="top-message"><MessageBarBody>工作包已锁定，形成只读放行基线并纳入审计记录。</MessageBarBody></MessageBar>}
+      {lowRemaining.length > 0 && <MessageBar intent="warning" className="top-message"><MessageBarBody><strong>时寿件低剩余循环：</strong>{lowRemaining.map((part) => `${part.id} ${part.name}（剩余 ${part.remainingCycles}）`).join('、')}，放行前须完成拆换。</MessageBarBody></MessageBar>}
       <div className="release-grid">
         <section className="panel release-main">
           <TabList selectedValue={tab} onTabSelect={(_, data) => setTab(String(data.value))}><Tab value="open">未关闭项目 <Badge>{blockers.length}</Badge></Tab><Tab value="repeat">重复缺陷 <Badge>2</Badge></Tab><Tab value="evidence">关键证据 <Badge>12</Badge></Tab></TabList>
@@ -222,7 +234,7 @@ function Release() {
         </section>
         <aside className="release-side">
           <section className="panel signoff-card"><div className="panel-head"><h2>分阶段签字</h2><span>{state.signatures.filter((item) => item.status === '已签署').length} / 4</span></div>{state.signatures.map((item) => <div className="signoff-row" key={item.stage}><div><span>{item.stage}</span><strong>{item.actor}</strong><small>{item.time}</small></div>{item.status === '已签署' ? <Badge appearance="tint" color="success">已签署</Badge> : <Button size="small" appearance="primary" onClick={() => dispatch(signStage(item.stage))}>签署</Button>}</div>)}</section>
-          <section className="panel release-gate-card"><LockClosedRegular /><h3>放行门禁</h3><label><Checkbox checked={!blockers.some((card) => card.status === '待授权')} readOnly /> 无待授权超差项目</label><label><Checkbox checked={state.cards.filter((card) => card.status === '已完成').length >= 6} readOnly /> 关键工卡完成率 ≥ 75%</label><label><Checkbox checked={allSigned} readOnly /> 四个阶段均完成电子签署</label><label><Checkbox checked /> 审计记录和证据附件完整</label></section>
+          <section className="panel release-gate-card"><LockClosedRegular /><h3>放行门禁</h3><label><Checkbox checked={!blockers.some((card) => card.status === '待授权')} readOnly /> 无待授权超差项目</label><label><Checkbox checked={state.cards.filter((card) => card.status === '已完成').length >= 6} readOnly /> 关键工卡完成率 ≥ 75%</label><label><Checkbox checked={allSigned} readOnly /> 四个阶段均完成电子签署</label><label><Checkbox checked={llpOk} readOnly /> 在装时寿件剩余循环 ≥ 500</label><label><Checkbox checked /> 审计记录和证据附件完整</label></section>
         </aside>
       </div>
     </div>
@@ -257,6 +269,211 @@ function Audit() {
   );
 }
 
+function LifeLedger() {
+  const state = useSelector((root: RootState) => root.maintenance);
+  const dispatch = useDispatch();
+  const [submitPartEvent] = useSubmitPartEventMutation();
+  const [forceFail, setForceFail] = useState(false);
+  const [cyclesInput, setCyclesInput] = useState(String(state.fuselageCycles));
+  const [correctingId, setCorrectingId] = useState<string | null>(null);
+  const [correctValue, setCorrectValue] = useState('');
+  const [installOpen, setInstallOpen] = useState(false);
+  const [installForm, setInstallForm] = useState({ partNumber: '', serial: '', name: '', location: '前起落架', limitCycles: '', workCardId: 'CARD-04' });
+
+  const installed = state.lifeParts.filter((part) => part.status === '在装');
+  const removed = state.lifeParts.filter((part) => part.status === '已拆');
+  const lowRemaining = installed.filter((part) => part.remainingCycles < 500);
+  const lastSubmitted = state.lifeEvents.find((event) => event.status === '已提交');
+
+  const submitRemove = async (part: LifePart, technician = '当前用户', fail = forceFail) => {
+    const eventNo = genEventNo();
+    const reason = part.removeReason ?? '定检拆换，寿命到期';
+    const payload = { partId: part.id, reason };
+    try {
+      const result = await submitPartEvent({ eventNo, type: '拆下', partId: part.id, cycles: state.fuselageCycles, technician, forceFail: fail, reason }).unwrap();
+      if (!result.duplicate) dispatch(removeLifePart({ partId: part.id, reason }));
+      dispatch(recordLifeEvent({ eventNo, type: '拆下', partId: part.id, cycles: state.fuselageCycles, date: nowString(), technician, status: '已提交', duplicate: result.duplicate, message: result.message, payload }));
+    } catch (error: any) {
+      const status = error.status === 409 ? '冲突' : '失败';
+      dispatch(recordLifeEvent({ eventNo, type: '拆下', partId: part.id, cycles: state.fuselageCycles, date: nowString(), technician, status, message: error.data?.message ?? '提交失败', payload }));
+    }
+  };
+
+  const retryEvent = async (event: LifeEventRecord) => {
+    const reason = event.payload?.reason ?? '定检拆换';
+    try {
+      const result = await submitPartEvent({ eventNo: event.eventNo, type: event.type, partId: event.partId, cycles: event.cycles, technician: event.technician, forceFail: false, reason }).unwrap();
+      if (!result.duplicate && event.type === '拆下' && event.partId) dispatch(removeLifePart({ partId: event.partId, reason }));
+      dispatch(recordLifeEvent({ ...event, status: '已提交', duplicate: result.duplicate, message: result.message }));
+    } catch (error: any) {
+      const status = error.status === 409 ? '冲突' : '失败';
+      dispatch(recordLifeEvent({ ...event, status, message: error.data?.message ?? '重试失败' }));
+    }
+  };
+
+  const demoConcurrency = async () => {
+    const target = state.lifeParts.find((part) => part.status === '在装');
+    if (!target) return;
+    const reason = '定检拆换（并发演示）';
+    const eventNo1 = genEventNo();
+    const eventNo2 = genEventNo();
+    const at = nowString();
+    const payload = { partId: target.id, reason };
+    const results = await Promise.allSettled([
+      submitPartEvent({ eventNo: eventNo1, type: '拆下', partId: target.id, cycles: state.fuselageCycles, technician: '宋杰', forceFail: false, reason }).unwrap(),
+      submitPartEvent({ eventNo: eventNo2, type: '拆下', partId: target.id, cycles: state.fuselageCycles, technician: '另一位技术员', forceFail: false, reason }).unwrap()
+    ]);
+    results.forEach((result, index) => {
+      const eventNo = index === 0 ? eventNo1 : eventNo2;
+      const technician = index === 0 ? '宋杰' : '另一位技术员';
+      if (result.status === 'fulfilled') {
+        if (!result.value.duplicate) dispatch(removeLifePart({ partId: target.id, reason }));
+        dispatch(recordLifeEvent({ eventNo, type: '拆下', partId: target.id, cycles: state.fuselageCycles, date: at, technician, status: '已提交', duplicate: result.value.duplicate, message: result.value.message, payload }));
+      } else {
+        dispatch(recordLifeEvent({ eventNo, type: '拆下', partId: target.id, cycles: state.fuselageCycles, date: at, technician, status: '冲突', message: result.reason?.data?.message ?? '提交冲突', payload }));
+      }
+    });
+  };
+
+  const demoDuplicate = async () => {
+    if (!lastSubmitted) return;
+    try {
+      const result = await submitPartEvent({ eventNo: lastSubmitted.eventNo, type: lastSubmitted.type, partId: lastSubmitted.partId, cycles: lastSubmitted.cycles, technician: lastSubmitted.technician, forceFail: false, reason: lastSubmitted.payload?.reason }).unwrap();
+      dispatch(recordLifeEvent({ ...lastSubmitted, duplicate: result.duplicate, message: result.message }));
+    } catch {
+      /* 事件号已处理，幂等返回 */
+    }
+  };
+
+  const submitInstall = async () => {
+    const eventNo = genEventNo();
+    const data = { ...installForm, limitCycles: Number(installForm.limitCycles) };
+    try {
+      const result = await submitPartEvent({ eventNo, type: '装机', cycles: state.fuselageCycles, technician: '当前用户', forceFail: false }).unwrap();
+      if (!result.duplicate) dispatch(installLifePart(data));
+      dispatch(recordLifeEvent({ eventNo, type: '装机', cycles: state.fuselageCycles, date: nowString(), technician: '当前用户', status: '已提交', duplicate: result.duplicate, payload: data }));
+      setInstallForm({ partNumber: '', serial: '', name: '', location: '前起落架', limitCycles: '', workCardId: 'CARD-04' });
+      setInstallOpen(false);
+    } catch (error: any) {
+      dispatch(recordLifeEvent({ eventNo, type: '装机', cycles: state.fuselageCycles, date: nowString(), technician: '当前用户', status: error.status === 409 ? '冲突' : '失败', message: error.data?.message, payload: data }));
+    }
+  };
+
+  const submitCyclesUpdate = () => {
+    const value = Number(cyclesInput);
+    if (!Number.isFinite(value) || value <= 0) return;
+    dispatch(updateFuselageCycles(value));
+  };
+
+  const submitCorrect = (partId: string) => {
+    const value = Number(correctValue);
+    if (!Number.isFinite(value)) return;
+    dispatch(correctPartHistory({ partId, installCycles: value }));
+    setCorrectingId(null);
+    setCorrectValue('');
+  };
+
+  return (
+    <div className="page">
+      <PageHeading eyebrow="LIFE LEDGER / B-7891" title="时寿件台账" description="工卡、时寿件履历、阶段签字与放行基线共用一本寿命账：装机冻结循环，拆下固化消耗。" actions={<Button appearance="primary" icon={<ArrowSyncRegular />} onClick={submitCyclesUpdate}>更新机身循环</Button>} />
+      {lowRemaining.length > 0 && <MessageBar intent="warning" className="top-message"><MessageBarBody><strong>低剩余循环预警：</strong>{lowRemaining.map((part) => `${part.id} ${part.name}（剩余 ${part.remainingCycles}）`).join('、')} 低于 500 循环，请安排拆换。</MessageBarBody></MessageBar>}
+      <div className="metrics-grid">
+        {[
+          ['机身循环', String(state.fuselageCycles), '寿命账基准', 'blue'],
+          ['在装时寿件', String(installed.length), '当前装机件参与重算', 'green'],
+          ['已拆时寿件', String(removed.length), '保留固化原值', 'amber'],
+          ['低剩余循环', String(lowRemaining.length), '低于 500 循环预警', lowRemaining.length ? 'red' : 'green']
+        ].map((item) => <div className="metric-card" key={item[0]}><span>{item[0]}</span><strong>{item[1]}</strong><small className={item[3]}>{item[2]}</small></div>)}
+      </div>
+      <div className="life-demo-bar">
+        <label className="life-demo-check"><Checkbox checked={forceFail} onChange={(_, data) => setForceFail(Boolean(data.checked))} /><span>模拟写入失败（下次提交保留草稿，按原事件号重试）</span></label>
+        <Button size="small" appearance="secondary" onClick={demoConcurrency}>模拟两名技术员同时拆换同一件</Button>
+        <Button size="small" appearance="secondary" onClick={demoDuplicate} disabled={!lastSubmitted}>模拟重复提交（按原事件号防重复）</Button>
+      </div>
+      <div className="life-grid">
+        <section className="panel life-parts-panel">
+          <div className="panel-head"><div><h2>时寿件履历</h2><span>装机冻结机身循环，拆下固化消耗；循环/履历变化只重算在装件</span></div><Badge appearance="tint">{state.lifeParts.length} 件</Badge></div>
+          <div className="life-parts">
+            {state.lifeParts.map((part) => (
+              <div className={`life-part ${part.status === '已拆' ? 'removed' : ''}`} key={part.id}>
+                <div className="life-part-head">
+                  <div><strong>{part.id} · {part.name}</strong><small>P/N {part.partNumber} · S/N {part.serial} · {part.location} · 工卡 {part.workCardId}</small></div>
+                  <Badge appearance="tint" color={part.status === '在装' ? 'success' : 'warning'}>{part.status}</Badge>
+                </div>
+                <div className="life-part-grid">
+                  <div><span>装机冻结循环</span><strong>{part.installCycles}</strong><small>{part.installDate}</small></div>
+                  <div><span>当前消耗</span><strong>{part.currentCycles}</strong><small>{part.status === '在装' ? '随机身循环重算' : '拆下固化'}</small></div>
+                  <div><span>剩余循环</span><strong className={part.remainingCycles < 500 ? 'low' : ''}>{part.remainingCycles}</strong><small>寿命限制 {part.limitCycles}</small></div>
+                  {part.status === '已拆' && part.removeCycles !== undefined && (
+                    <div><span>拆下固化消耗</span><strong>{part.removeCycles}</strong><small>{part.removeDate} · {part.removeReason}</small></div>
+                  )}
+                </div>
+                {part.status === '在装' && (
+                  <div className="life-part-actions">
+                    <Button size="small" appearance="primary" onClick={() => submitRemove(part)}>拆下并固化消耗</Button>
+                    <Button size="small" appearance="secondary" onClick={() => { setCorrectingId(part.id); setCorrectValue(String(part.installCycles)); }}>履历修正</Button>
+                  </div>
+                )}
+                {correctingId === part.id && (
+                  <div className="life-correct">
+                    <Field label="装机循环（修正履历后只重算在装件，依赖签字失效）"><Input type="number" value={correctValue} onChange={(_, data) => setCorrectValue(data.value)} /></Field>
+                    <Button size="small" appearance="primary" onClick={() => submitCorrect(part.id)}>确认修正</Button>
+                    <Button size="small" onClick={() => setCorrectingId(null)}>取消</Button>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </section>
+        <aside className="life-side">
+          <section className="panel">
+            <div className="panel-head"><h2>机身循环</h2><GaugeRegular /></div>
+            <div className="life-cycles">
+              <Field label="当前机身循环（更新后重算在装件）"><Input type="number" value={cyclesInput} onChange={(_, data) => setCyclesInput(data.value)} contentBefore={<GaugeRegular />} /></Field>
+              <Button appearance="primary" onClick={submitCyclesUpdate}>更新循环并重算</Button>
+              <p>更新后只重算当前装机件的剩余循环，已拆件保留固化原值；依赖签字失效，放行基线作废。</p>
+            </div>
+          </section>
+          <section className="panel">
+            <div className="panel-head"><h2>装机入账</h2><Button size="small" appearance="secondary" onClick={() => setInstallOpen((open) => !open)}>{installOpen ? '收起' : '新增装机'}</Button></div>
+            {installOpen && (
+              <div className="life-install">
+                <Field label="名称"><Input value={installForm.name} onChange={(_, data) => setInstallForm({ ...installForm, name: data.value })} placeholder="如 前起落架减震支柱" /></Field>
+                <div className="life-install-row"><Field label="件号 P/N"><Input value={installForm.partNumber} onChange={(_, data) => setInstallForm({ ...installForm, partNumber: data.value })} /></Field><Field label="序号 S/N"><Input value={installForm.serial} onChange={(_, data) => setInstallForm({ ...installForm, serial: data.value })} /></Field></div>
+                <div className="life-install-row"><Field label="安装位置"><Input value={installForm.location} onChange={(_, data) => setInstallForm({ ...installForm, location: data.value })} /></Field><Field label="寿命限制（循环）"><Input type="number" value={installForm.limitCycles} onChange={(_, data) => setInstallForm({ ...installForm, limitCycles: data.value })} /></Field></div>
+                <Button size="small" appearance="primary" onClick={submitInstall} disabled={!installForm.name || !installForm.limitCycles}>确认装机（冻结循环）</Button>
+              </div>
+            )}
+          </section>
+          <section className="panel">
+            <div className="panel-head"><h2>寿命账事件</h2><Badge appearance="tint">{state.lifeEvents.length}</Badge></div>
+            <div className="life-events">
+              {state.lifeEvents.length === 0 && <p className="life-empty">暂无寿命账事件。拆下、装机或循环更新将在此留痕。</p>}
+              {state.lifeEvents.map((event) => {
+                const statusSlug = event.status === '已提交' ? 'done' : event.status === '冲突' ? 'conflict' : 'failed';
+                return (
+                <div className={`life-event ${statusSlug}`} key={event.eventNo}>
+                  <div className="life-event-main">
+                    <strong>{event.type} · {event.eventNo}</strong>
+                    <small>{event.technician} · {event.date} · 循环 {event.cycles}</small>
+                    {event.message && <p>{event.message}</p>}
+                    {event.duplicate && <Tag appearance="outline" size="small">防重复 · 原事件号</Tag>}
+                  </div>
+                  <div className="life-event-side">
+                    <Badge appearance="tint" color={event.status === '已提交' ? 'success' : event.status === '冲突' ? 'danger' : 'warning'}>{event.status}</Badge>
+                    {(event.status === '失败' || event.status === '冲突') && <Button size="small" appearance="primary" onClick={() => retryEvent(event)}>按原事件号重试</Button>}
+                  </div>
+                </div>
+                );
+              })}
+            </div>
+          </section>
+        </aside>
+      </div>
+    </div>
+  );
+}
+
 function NotFound() {
   return <Navigate to="/" replace />;
 }
@@ -265,7 +482,7 @@ export default function App() {
   return (
     <FluentProvider theme={webLightTheme}>
       <BrowserRouter>
-        <Shell><Routes><Route path="/" element={<Overview />} /><Route path="/execution" element={<Execution />} /><Route path="/release" element={<Release />} /><Route path="/audit" element={<Audit />} /><Route path="*" element={<NotFound />} /></Routes></Shell>
+        <Shell><Routes><Route path="/" element={<Overview />} /><Route path="/execution" element={<Execution />} /><Route path="/life" element={<LifeLedger />} /><Route path="/release" element={<Release />} /><Route path="/audit" element={<Audit />} /><Route path="*" element={<NotFound />} /></Routes></Shell>
       </BrowserRouter>
     </FluentProvider>
   );
